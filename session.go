@@ -143,6 +143,44 @@ func NewQueueSession(builder SendAndReceiveBuilder, sessionID *string) *QueueSes
 	}
 }
 
+// Keep track of the passed in handler to call Start (exactly once) on it, but
+// only once we've started receiving messages.
+type DeferredStartHandler struct {
+	base           *SessionHandler
+	messageSession *MessageSession
+	started        sync.Once
+}
+
+// Start is called when a new session is started
+func (h *DeferredStartHandler) Start(ms *MessageSession) error {
+	return (*h.base).Start(ms)
+}
+
+// Called during handle, call `Start` if that hasn't happend yet
+func (h *DeferredStartHandler) CheckStart(ctx context.Context, msg *Message) error {
+	// If sessionID wasn't specified up front then we'll receive the "next
+	// available session". This needs to be recorded on the MessageSession so that
+	// client code can see the sessionid, and `RenewLock` knows what session to
+	// renew.
+	if h.messageSession.sessionID == nil {
+		h.messageSession.sessionID = msg.SessionID
+	}
+	return h.Start(h.messageSession)
+}
+
+// Handle is called when a new session message is received
+func (h *DeferredStartHandler) Handle(ctx context.Context, msg *Message) error {
+	var err error
+	h.started.Do(func() { err = h.CheckStart(ctx, msg) })
+	if err != nil {
+		return err
+	}
+	return (*h.base).Handle(ctx, msg)
+}
+func (h *DeferredStartHandler) End() {
+	(*h.base).End()
+}
+
 // ReceiveOne waits for the lock on a particular session to become available, takes it, then process the session.
 // The session can contain multiple messages. ReceiveOne will receive all messages within that session.
 //
@@ -162,14 +200,13 @@ func (qs *QueueSession) ReceiveOne(ctx context.Context, handler SessionHandler) 
 	if err != nil {
 		return err
 	}
-
-	err = handler.Start(ms)
-	if err != nil {
-		return err
+	dshandler := &DeferredStartHandler{
+		messageSession: ms,
+		base:           &handler,
 	}
 
-	defer handler.End()
-	handle := qs.receiver.Listen(ctx, handler)
+	defer dshandler.End()
+	handle := qs.receiver.Listen(ctx, dshandler)
 
 	select {
 	case <-handle.Done():
